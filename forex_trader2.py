@@ -83,7 +83,7 @@ class SystemState:
     api_limits_reached: bool = False
     trading_active: bool = True
     learning_active: bool = True
-    manual_confirmation_mode: bool = True
+    manual_confirmation_mode: bool = False
     show_background_process: bool = False
     mt5_connected: bool = False
     total_api_calls_today: int = 0
@@ -1805,7 +1805,7 @@ class ForexAITrader:
                 logger.warning("⚠️  No valid Gemini API keys configured - system will have limited functionality")
                 
             # Log system state
-            logger.info(f"🤝 Manual confirmation mode: {self.system_state.manual_confirmation_mode}")
+            logger.info(f"🤖 Automatic trading mode: {not self.system_state.manual_confirmation_mode}")
             logger.info(f"🔗 MT5 connection: {self.system_state.mt5_connected}")
                 
             # Create tasks for concurrent execution
