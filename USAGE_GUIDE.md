@@ -29,17 +29,17 @@ python3 forex_trader2.py
 
 ## 🎛️ **System Modes & Commands**
 
-### **🤝 Manual Confirmation Mode (Default)**
+### **🤖 Automatic Mode (Default)**
 - System analyzes markets continuously
-- **Asks permission before each trade**
+- **Executes trades automatically**
+- Still respects risk limits
+- Type `manual` to switch to confirmation mode
+
+### **🤝 Manual Confirmation Mode**
+- Type `manual` to switch
+- Asks permission before each trade
 - Shows detailed trade recommendations
 - You control every trade execution
-
-### **🤖 Automatic Mode**
-- Type `auto` to switch
-- Executes trades automatically
-- Still respects risk limits
-- Type `manual` to switch back
 
 ---
 
@@ -221,14 +221,14 @@ View with: `background` or `bg`
 
 ### **Safety Features**
 - 🛡️ Daily loss limits enforced
-- 🔒 Manual confirmation required by default
+- 🤖 Automatic trading with risk controls
 - 📊 Real-time risk monitoring
 - 🚫 Automatic system shutdown on API exhaustion
 
 ### **Best Practices**
-1. **Start in manual mode** to learn the system
-2. **Monitor background activities** regularly
-3. **Check system status** frequently
+1. **Monitor the automatic trading** regularly
+2. **Check background activities** with `bg` command
+3. **Verify system status** frequently with `system`
 4. **Use multiple API keys** for reliability
 5. **Set appropriate daily loss limits**
 
