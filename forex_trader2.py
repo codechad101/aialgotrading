@@ -97,6 +97,7 @@ class ForexAITrader:
         self.gemini_daily_limit = 1500  # Gemini free tier limit per key
         self.last_api_reset = datetime.now().date()
         self.current_api_key_index = 0  # Track which API key we're using
+        self.excluded_api_keys = set()  # Track temporarily excluded API keys
         
         # Communication queues
         self.chat_queue = queue.Queue()
@@ -270,6 +271,7 @@ class ForexAITrader:
         # Reset daily counters if new day
         if datetime.now().date() > self.last_api_reset:
             self.gemini_requests_today = {}
+            self.excluded_api_keys.clear()  # Reset excluded keys for new day
             self.last_api_reset = datetime.now().date()
             self.current_api_key_index = 0
         
@@ -963,7 +965,14 @@ class ForexAITrader:
                 if self.daily_reset_time is None or current_date > self.daily_reset_time:
                     self.current_daily_loss = 0.0
                     self.daily_reset_time = current_date
-                    logger.info("Daily loss counter reset")
+                    # Also reset API limits
+                    if current_date > self.last_api_reset:
+                        self.gemini_requests_today = {}
+                        self.excluded_api_keys.clear()
+                        self.last_api_reset = current_date
+                        logger.info("Daily limits reset (loss counter and API keys)")
+                    else:
+                        logger.info("Daily loss counter reset")
                 
                 # Update open trades
                 self.update_open_trades()
