@@ -1387,16 +1387,16 @@ class ForexAITrader:
             logger.info(f"Account Balance: ${self.account_balance:,.2f}")
             logger.info(f"Daily Loss Limit: ${self.daily_loss_limit:,.2f}")
             logger.info(f"Monitoring pairs: {', '.join(self.config['forex_pairs'])}")
-        
-        # Log API key status
-        api_keys = self.config.get('gemini_api_keys', [])
-        if api_keys and api_keys != ['your-gemini-api-key']:
-            logger.info(f"Gemini API Keys configured: {len(api_keys)} keys available")
-            for i, key in enumerate(api_keys):
-                logger.info(f"  API Key #{i+1}: ...{key[-4:]} (Limit: {self.gemini_daily_limit}/day)")
-        else:
-            logger.info("No Gemini API keys configured - using mock AI responses")
             
+            # Log API key status
+            api_keys = self.config.get('gemini_api_keys', [])
+            if api_keys and api_keys != ['your-gemini-api-key']:
+                logger.info(f"Gemini API Keys configured: {len(api_keys)} keys available")
+                for i, key in enumerate(api_keys):
+                    logger.info(f"  API Key #{i+1}: ...{key[-4:]} (Limit: {self.gemini_daily_limit}/day)")
+            else:
+                logger.info("No Gemini API keys configured - using mock AI responses")
+                
             # Create tasks for concurrent execution
             tasks = [
                 asyncio.create_task(self.continuous_learning_loop()),
