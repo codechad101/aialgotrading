@@ -682,9 +682,27 @@ class ForexAITrader:
             
             Consider:
             1. Current market trend and momentum
-            2. Technical indicator signals
+            2. Technical indicator signals (RSI, MACD, Moving Averages)
             3. Support/resistance levels
             4. Risk/reward potential
+            5. SHORT SELLING opportunities (SELL when expecting price to fall)
+            
+            Trading Actions:
+            - BUY: Go long (buy first, sell later at higher price)
+            - SELL: Go short (sell first, buy back later at lower price) 
+            - HOLD: No trade opportunity
+            
+            For SHORT SELLING (SELL action):
+            - Use when price is expected to FALL
+            - Take profit should be BELOW entry price
+            - Stop loss should be ABOVE entry price
+            - Profit = (Entry Price - Exit Price) * Position Size
+            
+            For LONG POSITION (BUY action):
+            - Use when price is expected to RISE
+            - Take profit should be ABOVE entry price
+            - Stop loss should be BELOW entry price
+            - Profit = (Exit Price - Entry Price) * Position Size
             
             Respond ONLY with a JSON object in this format:
             {{
@@ -693,7 +711,7 @@ class ForexAITrader:
                 "entry_price": price,
                 "stop_loss": price,
                 "take_profit": price,
-                "reasoning": "detailed explanation",
+                "reasoning": "detailed explanation including why BUY/SELL/SHORT",
                 "strategy_used": "strategy name",
                 "risk_reward_ratio": ratio
             }}
@@ -742,6 +760,171 @@ class ForexAITrader:
         except Exception as e:
             logger.error(f"Error calculating position size: {e}")
             return 0.01  # Default small size
+
+    async def execute_paper_trade(self, analysis: Dict[str, Any], pair: str, current_price: float) -> Optional[Trade]:
+        """Execute a paper trade based on AI analysis - supports both BUY and SELL (short selling)"""
+        try:
+            action = analysis['action']
+            confidence = analysis.get('confidence', 0.0)
+            
+            # Only execute if confidence is above threshold
+            if confidence < 0.6:
+                logger.info(f"Skipping trade - confidence too low: {confidence:.2f}")
+                return None
+            
+            # Calculate position size based on risk
+            stop_loss_pips = abs(current_price - analysis.get('stop_loss', current_price * 0.995)) / (0.0001 if "JPY" not in pair else 0.01)
+            position_size = self.calculate_position_size(pair, stop_loss_pips)
+            
+            # Create trade object
+            trade = Trade(
+                timestamp=datetime.now(),
+                pair=pair,
+                action=action,  # BUY or SELL (short selling)
+                entry_price=current_price,
+                stop_loss=analysis.get('stop_loss', current_price * (0.995 if action == 'BUY' else 1.005)),
+                take_profit=analysis.get('take_profit', current_price * (1.01 if action == 'BUY' else 0.99)),
+                size=position_size,
+                strategy=analysis.get('strategy_used', 'AI_Analysis'),
+                reasoning=analysis.get('reasoning', 'AI recommended trade'),
+                status="OPEN"
+            )
+            
+            # Log trade execution with short selling details
+            if action == 'SELL':
+                safe_log('info', f"SHORT SELL executed: {pair} at {current_price:.5f} (Position: {position_size}, Target: {trade.take_profit:.5f})", 
+                        f"📉 SHORT SELL executed: {pair} at {current_price:.5f} (Position: {position_size}, Target: {trade.take_profit:.5f})")
+            else:
+                safe_log('info', f"BUY executed: {pair} at {current_price:.5f} (Position: {position_size}, Target: {trade.take_profit:.5f})",
+                        f"📈 BUY executed: {pair} at {current_price:.5f} (Position: {position_size}, Target: {trade.take_profit:.5f})")
+            
+            # Add to open trades
+            self.open_trades.append(trade)
+            
+            # Save to database
+            self.save_trade_to_db(trade)
+            
+            return trade
+            
+        except Exception as e:
+            logger.error(f"Error executing paper trade: {e}")
+            return None
+
+    def update_open_trades(self):
+        """Update open trades and close profitable/stopped trades"""
+        try:
+            for trade in self.open_trades[:]:  # Copy list to avoid modification during iteration
+                if trade.status != "OPEN":
+                    continue
+                
+                # Get current market data
+                df = self.get_market_data(trade.pair)
+                if df is None or df.empty:
+                    continue
+                
+                current_price = df.iloc[-1]['close']
+                
+                # Check if trade should be closed
+                should_close = False
+                close_reason = ""
+                
+                if trade.action == 'BUY':
+                    # Long position
+                    if current_price >= trade.take_profit:
+                        should_close = True
+                        close_reason = "Take Profit Hit"
+                        trade.profit_loss = (current_price - trade.entry_price) * trade.size * 100000
+                    elif current_price <= trade.stop_loss:
+                        should_close = True
+                        close_reason = "Stop Loss Hit"
+                        trade.profit_loss = (current_price - trade.entry_price) * trade.size * 100000
+                        
+                elif trade.action == 'SELL':
+                    # Short position (sold first, buy back lower)
+                    if current_price <= trade.take_profit:
+                        should_close = True
+                        close_reason = "Take Profit Hit (Short)"
+                        trade.profit_loss = (trade.entry_price - current_price) * trade.size * 100000
+                    elif current_price >= trade.stop_loss:
+                        should_close = True
+                        close_reason = "Stop Loss Hit (Short)"
+                        trade.profit_loss = (trade.entry_price - current_price) * trade.size * 100000
+                
+                if should_close:
+                    trade.exit_price = current_price
+                    trade.status = "CLOSED"
+                    
+                    # Log trade closure
+                    profit_emoji = "💰" if trade.profit_loss > 0 else "💸"
+                    action_desc = "SHORT" if trade.action == 'SELL' else "LONG"
+                    safe_log('info', f"{action_desc} trade closed: {trade.pair} - {close_reason} - P/L: ${trade.profit_loss:.2f}",
+                            f"{profit_emoji} {action_desc} trade closed: {trade.pair} - {close_reason} - P/L: ${trade.profit_loss:.2f}")
+                    
+                    # Update account balance
+                    self.account_balance += trade.profit_loss
+                    
+                    # Track daily loss
+                    if trade.profit_loss < 0:
+                        self.current_daily_loss += abs(trade.profit_loss)
+                    
+                    # Move to trade history
+                    self.trade_history.append(trade)
+                    self.open_trades.remove(trade)
+                    
+                    # Update database
+                    self.update_trade_in_db(trade)
+                    
+        except Exception as e:
+            logger.error(f"Error updating open trades: {e}")
+
+    def save_trade_to_db(self, trade: Trade):
+        """Save trade to database"""
+        try:
+            with sqlite3.connect('trading_data.db') as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO trades (timestamp, pair, action, entry_price, exit_price, 
+                                      stop_loss, take_profit, size, profit_loss, strategy, 
+                                      reasoning, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    trade.timestamp.isoformat(),
+                    trade.pair,
+                    trade.action,
+                    trade.entry_price,
+                    trade.exit_price,
+                    trade.stop_loss,
+                    trade.take_profit,
+                    trade.size,
+                    trade.profit_loss,
+                    trade.strategy,
+                    trade.reasoning,
+                    trade.status
+                ))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error saving trade to database: {e}")
+
+    def update_trade_in_db(self, trade: Trade):
+        """Update trade in database when closed"""
+        try:
+            with sqlite3.connect('trading_data.db') as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    UPDATE trades 
+                    SET exit_price = ?, profit_loss = ?, status = ?
+                    WHERE timestamp = ? AND pair = ? AND action = ?
+                """, (
+                    trade.exit_price,
+                    trade.profit_loss,
+                    trade.status,
+                    trade.timestamp.isoformat(),
+                    trade.pair,
+                    trade.action
+                ))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error updating trade in database: {e}")
 
     async def execute_paper_trade(self, analysis: Dict[str, Any], pair: str, current_price: float) -> Optional[Trade]:
         """Execute a paper trade based on AI analysis"""
