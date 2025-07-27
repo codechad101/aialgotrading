@@ -35,20 +35,41 @@ import queue
 import signal
 import sys
 
-# Configure logging
+# Configure logging with UTF-8 encoding for Windows compatibility
+import sys
+log_handlers = [
+    logging.FileHandler('ai_trader.log', encoding='utf-8')
+]
+
+# For Windows console compatibility, use a plain StreamHandler without emojis
+if sys.platform.startswith('win'):
+    log_handlers.append(logging.StreamHandler())
+else:
+    log_handlers.append(logging.StreamHandler())
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('ai_trader.log'),
-        logging.StreamHandler()
-    ]
+    handlers=log_handlers
 )
 logger = logging.getLogger(__name__)
 
+def safe_log(level, message, emoji_message=None):
+    """Log message with Windows console compatibility"""
+    try:
+        if sys.platform.startswith('win'):
+            # Use plain text for Windows console
+            getattr(logger, level)(message)
+        else:
+            # Use emoji version for other platforms
+            getattr(logger, level)(emoji_message if emoji_message else message)
+    except UnicodeEncodeError:
+        # Fallback to plain message
+        getattr(logger, level)(message)
+
 # Log MT5 availability after logger is configured
 if not MT5_AVAILABLE:
-    logger.warning("MetaTrader5 not available - running in demo mode only")
+    safe_log('warning', "MetaTrader5 not available - running in demo mode only")
 
 @dataclass
 class Trade:
@@ -222,14 +243,14 @@ class ForexAITrader:
             
             if server and login and password:
                 if mt5.login(login, password, server):
-                    logger.info(f"✅ MT5 connected successfully to {server}")
+                    safe_log('info', f"MT5 connected successfully to {server}", f"✅ MT5 connected successfully to {server}")
                     self.system_state.mt5_connected = True
                     
                     # Get real account balance
                     account_info = mt5.account_info()
                     if account_info:
                         self.account_balance = account_info.balance
-                        logger.info(f"💰 Real account balance: ${self.account_balance:,.2f}")
+                        safe_log('info', f"Real account balance: ${self.account_balance:,.2f}", f"💰 Real account balance: ${self.account_balance:,.2f}")
                 else:
                     logger.warning("MT5 login failed - using demo mode")
                     self.system_state.mt5_connected = False
@@ -351,7 +372,7 @@ class ForexAITrader:
         api_key = self.get_next_available_api_key()
         
         if not api_key:
-            logger.error("🚫 All Gemini API keys have reached daily limit - SYSTEM OUT OF COMMISSION!")
+            safe_log('error', "All Gemini API keys have reached daily limit - SYSTEM OUT OF COMMISSION!", "🚫 All Gemini API keys have reached daily limit - SYSTEM OUT OF COMMISSION!")
             self.system_state.api_limits_reached = True
             self.system_state.trading_active = False
             self.system_state.learning_active = False
@@ -1124,7 +1145,7 @@ class ForexAITrader:
             try:
                 # Check if system is out of commission
                 if self.system_state.api_limits_reached:
-                    logger.error("🚫 System out of commission due to API limits - stopping learning loop")
+                    safe_log('error', "System out of commission due to API limits - stopping learning loop", "🚫 System out of commission due to API limits - stopping learning loop")
                     break
                 
                 # Reset daily loss counter if new day
@@ -1790,23 +1811,23 @@ class ForexAITrader:
         """Main system runner"""
         try:
             self.running = True
-            logger.info("🚀 AI Forex Trading System Starting...")
-            logger.info(f"Account Balance: ${self.account_balance:,.2f}")
-            logger.info(f"Daily Loss Limit: ${self.daily_loss_limit:,.2f}")
-            logger.info(f"Monitoring pairs: {', '.join(self.config['forex_pairs'])}")
+            safe_log('info', "AI Forex Trading System Starting...", "🚀 AI Forex Trading System Starting...")
+            safe_log('info', f"Account Balance: ${self.account_balance:,.2f}")
+            safe_log('info', f"Daily Loss Limit: ${self.daily_loss_limit:,.2f}")
+            safe_log('info', f"Monitoring pairs: {', '.join(self.config['forex_pairs'])}")
             
             # Log API key status
             api_keys = self.config.get('gemini_api_keys', [])
             if api_keys and api_keys != ['your-gemini-api-key']:
-                logger.info(f"Gemini API Keys configured: {len(api_keys)} keys available")
+                safe_log('info', f"Gemini API Keys configured: {len(api_keys)} keys available")
                 for i, key in enumerate(api_keys):
-                    logger.info(f"  API Key #{i+1}: ...{key[-4:]} (Limit: {self.gemini_daily_limit}/day)")
+                    safe_log('info', f"  API Key #{i+1}: ...{key[-4:]} (Limit: {self.gemini_daily_limit}/day)")
             else:
-                logger.warning("⚠️  No valid Gemini API keys configured - system will have limited functionality")
+                safe_log('warning', "No valid Gemini API keys configured - system will have limited functionality", "⚠️  No valid Gemini API keys configured - system will have limited functionality")
                 
             # Log system state
-            logger.info(f"🤖 Automatic trading mode: {not self.system_state.manual_confirmation_mode}")
-            logger.info(f"🔗 MT5 connection: {self.system_state.mt5_connected}")
+            safe_log('info', f"Automatic trading mode: {not self.system_state.manual_confirmation_mode}", f"🤖 Automatic trading mode: {not self.system_state.manual_confirmation_mode}")
+            safe_log('info', f"MT5 connection: {self.system_state.mt5_connected}", f"🔗 MT5 connection: {self.system_state.mt5_connected}")
                 
             # Create tasks for concurrent execution
             tasks = [
