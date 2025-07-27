@@ -77,11 +77,27 @@ class Strategy:
     last_updated: Optional[datetime] = None
     performance_score: float = 0.0
 
+@dataclass
+class SystemState:
+    """Track overall system state"""
+    api_limits_reached: bool = False
+    trading_active: bool = True
+    learning_active: bool = True
+    manual_confirmation_mode: bool = True
+    show_background_process: bool = False
+    mt5_connected: bool = False
+    total_api_calls_today: int = 0
+    last_trade_signal: Optional[Dict] = None
+    pending_trade_confirmation: Optional[Dict] = None
+
 class ForexAITrader:
     def __init__(self, config_path: str = "config.json"):
         self.running = False
         self.learning_active = True
         self.config = self.load_config(config_path)
+        
+        # System state management
+        self.system_state = SystemState()
         
         # Account settings
         self.account_balance = self.config.get('account_balance', 200000.0)  # Configurable account size
@@ -104,6 +120,11 @@ class ForexAITrader:
         # Communication queues
         self.chat_queue = queue.Queue()
         self.status_queue = queue.Queue()
+        self.trade_confirmation_queue = queue.Queue()
+        
+        # Background learning display
+        self.learning_display_active = False
+        self.background_activities = []
         
         # Initialize components
         self.init_database()
@@ -183,35 +204,42 @@ class ForexAITrader:
 
     def init_mt5(self):
         """Initialize MetaTrader 5 connection"""
+        if not MT5_AVAILABLE:
+            logger.warning("MT5 not available - using demo data")
+            self.system_state.mt5_connected = False
+            return
+        
         try:
-            if not MT5_AVAILABLE:
-                logger.warning("MetaTrader 5 not available - using demo mode only")
-                return False
-                
             if not mt5.initialize():
                 logger.error("MT5 initialization failed")
-                return False
+                self.system_state.mt5_connected = False
+                return
             
-            # Login to MT5 (only if credentials are provided)
-            if (self.config['mt5_login'] != "your-login" and 
-                self.config['mt5_password'] != "your-password" and
-                self.config['mt5_server'] != "your-mt5-server"):
-                
-                if not mt5.login(
-                    login=int(self.config['mt5_login']),
-                    password=self.config['mt5_password'],
-                    server=self.config['mt5_server']
-                ):
-                    logger.error("MT5 login failed - using demo data")
-                    return False
-                
-                logger.info("MetaTrader 5 initialized and logged in successfully")
+            # Try to connect with config credentials
+            server = self.config.get('mt5_server')
+            login = self.config.get('mt5_login')
+            password = self.config.get('mt5_password')
+            
+            if server and login and password:
+                if mt5.login(login, password, server):
+                    logger.info(f"✅ MT5 connected successfully to {server}")
+                    self.system_state.mt5_connected = True
+                    
+                    # Get real account balance
+                    account_info = mt5.account_info()
+                    if account_info:
+                        self.account_balance = account_info.balance
+                        logger.info(f"💰 Real account balance: ${self.account_balance:,.2f}")
+                else:
+                    logger.warning("MT5 login failed - using demo mode")
+                    self.system_state.mt5_connected = False
             else:
                 logger.warning("MT5 credentials not configured - using demo mode")
-            return True
+                self.system_state.mt5_connected = False
+                
         except Exception as e:
             logger.error(f"MT5 initialization error: {e}")
-            return False
+            self.system_state.mt5_connected = False
 
     def load_strategies(self):
         """Load strategies from database and local storage"""
@@ -315,11 +343,19 @@ class ForexAITrader:
 
     async def call_gemini_api(self, prompt: str, max_retries: int = 3) -> Optional[str]:
         """Call Gemini API with alternating key rotation and automatic exclusion"""
+        # Check if API limits reached
+        if self.system_state.api_limits_reached:
+            logger.error("🚫 System out of commission - All API limits reached!")
+            return None
+            
         api_key = self.get_next_available_api_key()
         
         if not api_key:
-            logger.warning("No Gemini API keys available or all limits reached - using mock response")
-            return self.generate_mock_response(prompt)
+            logger.error("🚫 All Gemini API keys have reached daily limit - SYSTEM OUT OF COMMISSION!")
+            self.system_state.api_limits_reached = True
+            self.system_state.trading_active = False
+            self.system_state.learning_active = False
+            return None
         
         for attempt in range(max_retries):
             try:
@@ -501,17 +537,25 @@ class ForexAITrader:
             logger.error(f"Error getting API limit status: {e}")
             return {"error": str(e)}
 
-    def get_market_data(self, symbol: str, timeframe=mt5.TIMEFRAME_M15, count: int = 100) -> Optional[pd.DataFrame]:
+    def get_market_data(self, symbol: str, timeframe=None, count: int = 100) -> Optional[pd.DataFrame]:
         """Get market data from MT5 or generate demo data"""
         try:
-            # Try to get real data from MT5
-            rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
-            if rates is not None:
-                df = pd.DataFrame(rates)
-                df['time'] = pd.to_datetime(df['time'], unit='s')
-                return df
+            # Use MT5 if connected
+            if self.system_state.mt5_connected and MT5_AVAILABLE:
+                if timeframe is None:
+                    timeframe = mt5.TIMEFRAME_M15
+                    
+                rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+                if rates is not None and len(rates) > 0:
+                    df = pd.DataFrame(rates)
+                    df['time'] = pd.to_datetime(df['time'], unit='s')
+                    logger.debug(f"✅ Got {len(df)} real data points for {symbol} from MT5")
+                    return df
+                else:
+                    logger.warning(f"No MT5 data available for {symbol}, using demo data")
+                    return self.generate_demo_data(symbol, count)
             else:
-                logger.warning(f"Failed to get real rates for {symbol}, using demo data")
+                logger.debug(f"MT5 not connected, using demo data for {symbol}")
                 return self.generate_demo_data(symbol, count)
             
         except Exception as e:
@@ -956,12 +1000,133 @@ class ForexAITrader:
             logger.error(f"Error calculating performance stats: {e}")
             return {"error": str(e)}
 
+    async def request_trade_confirmation(self, analysis: Dict[str, Any], pair: str, current_price: float) -> bool:
+        """Request user confirmation for trade execution"""
+        try:
+            # Store pending trade information
+            self.system_state.pending_trade_confirmation = {
+                "pair": pair,
+                "action": analysis['action'],
+                "price": current_price,
+                "confidence": analysis.get('confidence', 0),
+                "reasoning": analysis.get('reasoning', 'No reasoning provided'),
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            # Display trade recommendation
+            print(f"\n🔔 TRADE SIGNAL DETECTED!")
+            print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            print(f"📈 Pair: {pair}")
+            print(f"🎯 Action: {analysis['action']}")
+            print(f"💰 Price: {current_price:.5f}")
+            print(f"🎲 Confidence: {analysis.get('confidence', 0):.2f}")
+            print(f"🧠 Reasoning: {analysis.get('reasoning', 'No reasoning provided')}")
+            print(f"📊 Strategy: {analysis.get('strategy_used', 'Unknown')}")
+            if 'risk_reward_ratio' in analysis:
+                print(f"⚖️  Risk/Reward: 1:{analysis['risk_reward_ratio']}")
+            print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            print(f"Execute this trade? (y/n/auto): ", end="", flush=True)
+            
+            # Wait for user input with timeout
+            response = await self.wait_for_user_input(timeout=30)
+            
+            if response.lower() in ['y', 'yes']:
+                return True
+            elif response.lower() in ['auto']:
+                self.system_state.manual_confirmation_mode = False
+                logger.info("🤖 Switched to automatic trading mode")
+                return True
+            else:
+                return False
+                
+        except Exception as e:
+            logger.error(f"Error in trade confirmation: {e}")
+            return False
+
+    async def wait_for_user_input(self, timeout: int = 30) -> str:
+        """Wait for user input with timeout"""
+        try:
+            # Use a simple approach for input with timeout
+            import select
+            import sys
+            
+            if select.select([sys.stdin], [], [], timeout):
+                return input().strip()
+            else:
+                print("⏰ Timeout - skipping trade")
+                return "n"
+        except:
+            # Fallback for systems without select
+            return "n"
+
+    def log_background_activity(self, activity: str):
+        """Log background learning/trading activities"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        formatted_activity = f"[{timestamp}] {activity}"
+        
+        # Add to background activities list (keep last 50)
+        self.background_activities.append(formatted_activity)
+        if len(self.background_activities) > 50:
+            self.background_activities.pop(0)
+        
+        # Display if background display is active
+        if self.system_state.show_background_process:
+            print(formatted_activity)
+
+    def show_background_activities(self):
+        """Display recent background activities"""
+        print(f"\n📚 BACKGROUND LEARNING ACTIVITIES (Last {len(self.background_activities)} events)")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        
+        if not self.background_activities:
+            print("🔍 No recent activities recorded")
+        else:
+            for activity in self.background_activities[-20:]:  # Show last 20
+                print(activity)
+        
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print("💡 Type 'toggle_bg' to show/hide real-time background activities")
+
+    def get_system_status(self) -> Dict[str, Any]:
+        """Get comprehensive system status"""
+        try:
+            api_status = self.get_api_limit_status()
+            performance = self.get_performance_stats()
+            
+            return {
+                "system_state": {
+                    "api_limits_reached": self.system_state.api_limits_reached,
+                    "trading_active": self.system_state.trading_active,
+                    "learning_active": self.system_state.learning_active,
+                    "manual_confirmation_mode": self.system_state.manual_confirmation_mode,
+                    "mt5_connected": self.system_state.mt5_connected,
+                    "show_background_process": self.system_state.show_background_process
+                },
+                "account": {
+                    "balance": self.account_balance,
+                    "daily_loss": self.current_daily_loss,
+                    "daily_limit": self.daily_loss_limit,
+                    "open_trades": len(self.open_trades)
+                },
+                "api_status": api_status,
+                "performance": performance,
+                "pending_trade": self.system_state.pending_trade_confirmation
+            }
+        except Exception as e:
+            logger.error(f"Error getting system status: {e}")
+            return {"error": str(e)}
+
     async def continuous_learning_loop(self):
         """Main continuous learning and trading loop"""
         logger.info("Starting continuous learning loop...")
         
-        while self.learning_active and self.running:
+        while self.learning_active and self.running and not self.system_state.api_limits_reached:
             try:
+                # Check if system is out of commission
+                if self.system_state.api_limits_reached:
+                    logger.error("🚫 System out of commission due to API limits - stopping learning loop")
+                    break
+                
                 # Reset daily loss counter if new day
                 current_date = datetime.now().date()
                 if self.daily_reset_time is None or current_date > self.daily_reset_time:
@@ -971,10 +1136,15 @@ class ForexAITrader:
                     if current_date > self.last_api_reset:
                         self.gemini_requests_today = {}
                         self.excluded_api_keys.clear()
+                        self.system_state.api_limits_reached = False  # Reset system state
+                        self.system_state.trading_active = True
+                        self.system_state.learning_active = True
                         self.last_api_reset = current_date
-                        logger.info("Daily limits reset (loss counter and API keys)")
+                        logger.info("Daily limits reset (loss counter and API keys) - System reactivated")
+                        self.log_background_activity("🔄 Daily reset completed - System reactivated")
                     else:
                         logger.info("Daily loss counter reset")
+                        self.log_background_activity("🔄 Daily loss counter reset")
                 
                 # Update open trades
                 self.update_open_trades()
@@ -1007,20 +1177,42 @@ class ForexAITrader:
                         api_key_info = f"[API Key #{self.current_api_key_index + 1}]" if self.config.get('gemini_api_keys') else "[Mock AI]"
                         logger.info(f"{api_key_info} Analyzing {pair}: Price {current_price:.5f}, Action: {analysis.get('action', 'HOLD')}, Confidence: {analysis.get('confidence', 0):.2f}")
                         
-                        # Execute paper trade if conditions are met
+                        # Execute trade with confirmation if needed
                         if analysis['action'] != 'HOLD':
-                            trade = await self.execute_paper_trade(analysis, pair, current_price)
-                            if trade:
-                                # Save learning data to local storage
-                                learning_data = {
-                                    "timestamp": datetime.now().isoformat(),
-                                    "pair": pair,
-                                    "market_data": df.tail(5).to_dict('records'),
-                                    "analysis": analysis,
-                                    "trade": asdict(trade)
-                                }
-                                with open(f"data/learning/{pair}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", 'w') as f:
-                                    json.dump(learning_data, f, indent=2)
+                            if self.system_state.manual_confirmation_mode:
+                                # Ask for trade confirmation
+                                confirmation = await self.request_trade_confirmation(analysis, pair, current_price)
+                                if confirmation:
+                                    trade = await self.execute_paper_trade(analysis, pair, current_price)
+                                    if trade:
+                                        self.log_background_activity(f"✅ Trade executed: {trade.action} {trade.pair} at {trade.entry_price}")
+                                        # Save learning data to local storage
+                                        learning_data = {
+                                            "timestamp": datetime.now().isoformat(),
+                                            "pair": pair,
+                                            "market_data": df.tail(5).to_dict('records'),
+                                            "analysis": analysis,
+                                            "trade": asdict(trade)
+                                        }
+                                        with open(f"data/learning/{pair}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", 'w') as f:
+                                            json.dump(learning_data, f, indent=2)
+                                else:
+                                    self.log_background_activity(f"❌ Trade rejected by user: {analysis['action']} {pair}")
+                            else:
+                                # Auto-execute without confirmation
+                                trade = await self.execute_paper_trade(analysis, pair, current_price)
+                                if trade:
+                                    self.log_background_activity(f"⚡ Auto-executed: {trade.action} {trade.pair} at {trade.entry_price}")
+                                    # Save learning data to local storage
+                                    learning_data = {
+                                        "timestamp": datetime.now().isoformat(),
+                                        "pair": pair,
+                                        "market_data": df.tail(5).to_dict('records'),
+                                        "analysis": analysis,
+                                        "trade": asdict(trade)
+                                    }
+                                    with open(f"data/learning/{pair}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json", 'w') as f:
+                                        json.dump(learning_data, f, indent=2)
                         
                         # Small delay between pairs
                         await asyncio.sleep(2)
@@ -1462,6 +1654,193 @@ class ForexAITrader:
             
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
+
+    async def chat_interface(self):
+        """Interactive chat interface for real-time communication"""
+        logger.info("Chat interface started")
+        
+        while self.running:
+            try:
+                if not self.chat_queue.empty():
+                    message = self.chat_queue.get()
+                    
+                    if message.lower() in ['quit', 'exit', 'stop']:
+                        logger.info("Shutdown requested via chat")
+                        self.running = False
+                        break
+                    elif message.lower() == 'balance':
+                        print(f"\n💰 Account Balance: ${self.account_balance:,.2f}")
+                        print(f"📉 Daily Loss: ${self.current_daily_loss:.2f}")
+                        print(f"🚫 Daily Limit: ${self.daily_loss_limit:.2f}")
+                        print()
+                    elif message.lower() == 'trades':
+                        recent_trades = self.trade_history[-5:] if self.trade_history else []
+                        if recent_trades:
+                            print(f"\n📈 Recent Trades:")
+                            for trade in recent_trades:
+                                status_emoji = "✅" if trade.profit_loss > 0 else "❌"
+                                print(f"  {status_emoji} {trade.pair} {trade.action} at {trade.entry_price:.5f} - P/L: ${trade.profit_loss:.2f}")
+                        else:
+                            print("📭 No trades executed yet")
+                        print()
+                    elif message.lower() == 'pairs':
+                        print(f"\n📊 Monitored Pairs: {', '.join(self.config['forex_pairs'])}")
+                        print()
+                    elif message.lower() == 'status':
+                        api_status = self.get_api_limit_status()
+                        print(f"\n🔍 System Status:")
+                        print(f"  🟢 Running: {self.running}")
+                        print(f"  🧠 Learning: {self.learning_active}")
+                        print(f"  🤝 Manual Mode: {self.system_state.manual_confirmation_mode}")
+                        print(f"  🔗 MT5: {self.system_state.mt5_connected}")
+                        print(f"  📡 API Calls Today: {api_status.get('total_requests_today', 0)}")
+                        print(f"  ⚡ Remaining: {api_status.get('estimated_remaining_requests', 0)}")
+                        print()
+                    elif message.lower() == 'system':
+                        system_status = self.get_system_status()
+                        print(f"\n🖥️  SYSTEM STATUS:")
+                        print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                        state = system_status['system_state']
+                        print(f"🟢 Trading Active: {state['trading_active']}")
+                        print(f"🧠 Learning Active: {state['learning_active']}")
+                        print(f"🤝 Manual Confirmation: {state['manual_confirmation_mode']}")
+                        print(f"🔗 MT5 Connected: {state['mt5_connected']}")
+                        print(f"🚫 API Limits Reached: {state['api_limits_reached']}")
+                        print(f"👁️  Background Display: {state['show_background_process']}")
+                        
+                        account = system_status['account']
+                        print(f"\n💰 ACCOUNT:")
+                        print(f"Balance: ${account['balance']:,.2f}")
+                        print(f"Daily Loss: ${account['daily_loss']:.2f}")
+                        print(f"Open Trades: {account['open_trades']}")
+                        
+                    elif message.lower() == 'background' or message.lower() == 'bg':
+                        self.show_background_activities()
+                        
+                    elif message.lower() == 'toggle_bg':
+                        self.system_state.show_background_process = not self.system_state.show_background_process
+                        status = "enabled" if self.system_state.show_background_process else "disabled"
+                        print(f"🔄 Real-time background display {status}")
+                        
+                    elif message.lower() == 'auto':
+                        self.system_state.manual_confirmation_mode = False
+                        print("🤖 Switched to automatic trading mode")
+                        
+                    elif message.lower() == 'manual':
+                        self.system_state.manual_confirmation_mode = True
+                        print("🤝 Switched to manual confirmation mode")
+                        
+                    elif message.lower() == 'help':
+                        print("""
+                        Available commands:
+                        - system: Show detailed system status
+                        - balance: Show current account balance
+                        - trades: Show recent trades
+                        - pairs: Show monitored forex pairs
+                        - background/bg: Show recent background activities
+                        - toggle_bg: Toggle real-time background display
+                        - auto: Switch to automatic trading
+                        - manual: Switch to manual confirmation
+                        - status: Show basic system status
+                        - help: Show this help message
+                        - quit/exit: Stop the system
+                        
+                        Or ask any trading-related question!
+                        """)
+                    else:
+                        # AI chat response
+                        if not self.system_state.api_limits_reached:
+                            response = await self.get_ai_chat_response(message)
+                            if response:
+                                print(f"\n🤖 AI Response: {response}\n")
+                            else:
+                                print("🤖 AI is currently unavailable.")
+                        else:
+                            print("🤖 AI is currently unavailable due to API limits.")
+                            
+                await asyncio.sleep(0.1)  # Small delay to prevent busy waiting
+                
+            except Exception as e:
+                logger.error(f"Error in chat interface: {e}")
+
+    async def get_ai_chat_response(self, message: str) -> Optional[str]:
+        """Get AI response for chat messages"""
+        try:
+            prompt = f"""
+            You are an AI forex trading assistant. The user is asking: "{message}"
+            
+            Current system status:
+            - Account Balance: ${self.account_balance:,.2f}
+            - Open Trades: {len(self.open_trades)}
+            - Total Trades Today: {len(self.trade_history)}
+            - Win Rate: {(len([t for t in self.trade_history if t.profit_loss > 0]) / len(self.trade_history) * 100) if self.trade_history else 0:.1f}%
+            
+            Provide a helpful, concise response about forex trading, market analysis, or system management.
+            Keep responses under 100 words and be practical.
+            """
+            
+            response = await self.call_gemini_api(prompt)
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error getting AI chat response: {e}")
+            return None
+
+    async def run_system(self):
+        """Main system runner"""
+        try:
+            self.running = True
+            logger.info("🚀 AI Forex Trading System Starting...")
+            logger.info(f"Account Balance: ${self.account_balance:,.2f}")
+            logger.info(f"Daily Loss Limit: ${self.daily_loss_limit:,.2f}")
+            logger.info(f"Monitoring pairs: {', '.join(self.config['forex_pairs'])}")
+            
+            # Log API key status
+            api_keys = self.config.get('gemini_api_keys', [])
+            if api_keys and api_keys != ['your-gemini-api-key']:
+                logger.info(f"Gemini API Keys configured: {len(api_keys)} keys available")
+                for i, key in enumerate(api_keys):
+                    logger.info(f"  API Key #{i+1}: ...{key[-4:]} (Limit: {self.gemini_daily_limit}/day)")
+            else:
+                logger.warning("⚠️  No valid Gemini API keys configured - system will have limited functionality")
+                
+            # Log system state
+            logger.info(f"🤝 Manual confirmation mode: {self.system_state.manual_confirmation_mode}")
+            logger.info(f"🔗 MT5 connection: {self.system_state.mt5_connected}")
+                
+            # Create tasks for concurrent execution
+            tasks = [
+                asyncio.create_task(self.continuous_learning_loop()),
+                asyncio.create_task(self.chat_interface())
+            ]
+            
+            # Start input thread for chat
+            input_thread = threading.Thread(target=self.input_handler, daemon=True)
+            input_thread.start()
+            
+            # Run all tasks
+            await asyncio.gather(*tasks, return_exceptions=True)
+            
+        except KeyboardInterrupt:
+            logger.info("Received keyboard interrupt")
+        except Exception as e:
+            logger.error(f"System error: {e}")
+        finally:
+            await self.cleanup()
+
+    def input_handler(self):
+        """Handle user input in a separate thread"""
+        try:
+            while self.running:
+                try:
+                    user_input = input()
+                    if user_input.strip():
+                        self.chat_queue.put(user_input.strip())
+                except (EOFError, KeyboardInterrupt):
+                    logger.info("Input handler stopping")
+                    break
+        except Exception as e:
+            logger.error(f"Error in input handler: {e}")
 
 # Main execution
 if __name__ == "__main__":
