@@ -97,6 +97,7 @@ class ForexAITrader:
         self.gemini_daily_limit = 1500  # Gemini free tier limit per key
         self.last_api_reset = datetime.now().date()
         self.current_api_key_index = 0  # Track which API key we're using
+        self.excluded_api_keys = set()  # Track temporarily excluded API keys
         
         # Communication queues
         self.chat_queue = queue.Queue()
@@ -270,6 +271,7 @@ class ForexAITrader:
         # Reset daily counters if new day
         if datetime.now().date() > self.last_api_reset:
             self.gemini_requests_today = {}
+            self.excluded_api_keys.clear()  # Reset excluded keys for new day
             self.last_api_reset = datetime.now().date()
             self.current_api_key_index = 0
         
@@ -383,6 +385,9 @@ class ForexAITrader:
                 lambda: requests.post(url, headers=headers, json=data)
             )
             
+            # Extract rate limit information from response headers
+            self.log_api_limit_info(response, api_key)
+            
             if response.status_code == 200:
                 result = response.json()
                 if 'candidates' in result and len(result['candidates']) > 0:
@@ -391,13 +396,108 @@ class ForexAITrader:
                 else:
                     logger.error("No content in Gemini response")
                     return None
+            elif response.status_code == 429:
+                # Rate limit exceeded
+                error_data = response.json() if response.content else {}
+                retry_after = response.headers.get('Retry-After', 'unknown')
+                logger.warning(f"Rate limit exceeded for API key ...{api_key[-4:]}. Retry after: {retry_after} seconds. Error: {error_data}")
+                
+                # Mark this key as having hit limits
+                if api_key not in self.excluded_api_keys:
+                    self.excluded_api_keys.add(api_key)
+                    logger.info(f"API key ...{api_key[-4:]} temporarily excluded due to rate limit")
+                
+                return None
+            elif response.status_code == 403:
+                # Quota exceeded or API key invalid
+                error_data = response.json() if response.content else {}
+                logger.error(f"Quota exceeded or invalid API key ...{api_key[-4:]}. Error: {error_data}")
+                
+                # Mark this key as having hit limits
+                if api_key not in self.excluded_api_keys:
+                    self.excluded_api_keys.add(api_key)
+                    logger.info(f"API key ...{api_key[-4:]} excluded due to quota/permission issues")
+                
+                return None
             else:
-                logger.error(f"Gemini API request failed: {response.status_code} - {response.text}")
+                error_response = response.text
+                logger.error(f"Gemini API request failed: {response.status_code} - {error_response}")
                 return None
                 
         except Exception as e:
             logger.error(f"Gemini API request error: {e}")
             return None
+
+    def log_api_limit_info(self, response, api_key: str):
+        """Extract and log API limit information from response headers"""
+        try:
+            headers = response.headers
+            
+            # Common rate limit headers to check
+            limit_headers = {
+                'x-ratelimit-limit': 'Request Limit',
+                'x-ratelimit-remaining': 'Requests Remaining',
+                'x-ratelimit-reset': 'Reset Time',
+                'x-quota-limit': 'Quota Limit',
+                'x-quota-remaining': 'Quota Remaining',
+                'x-quota-reset': 'Quota Reset',
+                'retry-after': 'Retry After (seconds)',
+                'x-daily-quota-remaining': 'Daily Quota Remaining',
+                'x-hourly-quota-remaining': 'Hourly Quota Remaining'
+            }
+            
+            limit_info = {}
+            for header, description in limit_headers.items():
+                if header in headers:
+                    limit_info[description] = headers[header]
+            
+            if limit_info:
+                limit_str = ", ".join([f"{desc}: {val}" for desc, val in limit_info.items()])
+                logger.info(f"API Key ...{api_key[-4:]} limits - {limit_str}")
+            
+            # Also store for external access
+            if not hasattr(self, 'api_limit_info'):
+                self.api_limit_info = {}
+            
+            self.api_limit_info[api_key] = {
+                'timestamp': datetime.now().isoformat(),
+                'status_code': response.status_code,
+                'headers': dict(headers),
+                'limit_info': limit_info
+            }
+            
+        except Exception as e:
+            logger.debug(f"Error extracting API limit info: {e}")
+
+    def get_api_limit_status(self) -> Dict[str, Any]:
+        """Get current API limit status for all keys"""
+        try:
+            status = {
+                'total_keys': len(self.config.get('gemini_api_keys', [])),
+                'excluded_keys': len(self.excluded_api_keys),
+                'current_key_index': self.current_api_key_index,
+                'requests_today': dict(self.gemini_requests_today),
+                'daily_limit_per_key': self.gemini_daily_limit,
+                'last_limit_info': getattr(self, 'api_limit_info', {})
+            }
+            
+            # Calculate total requests across all keys
+            total_requests = sum(self.gemini_requests_today.values())
+            status['total_requests_today'] = total_requests
+            
+            # Estimate remaining capacity
+            available_keys = len(self.config.get('gemini_api_keys', [])) - len(self.excluded_api_keys)
+            if available_keys > 0:
+                estimated_remaining = (available_keys * self.gemini_daily_limit) - total_requests
+                status['estimated_remaining_requests'] = max(0, estimated_remaining)
+            else:
+                status['estimated_remaining_requests'] = 0
+            
+            return status
+            
+        except Exception as e:
+            logger.error(f"Error getting API limit status: {e}")
+            return {"error": str(e)}
 
     def get_market_data(self, symbol: str, timeframe=mt5.TIMEFRAME_M15, count: int = 100) -> Optional[pd.DataFrame]:
         """Get market data from MT5 or generate demo data"""
@@ -791,6 +891,7 @@ class ForexAITrader:
         try:
             total_trades = len(self.trade_history)
             if total_trades == 0:
+                api_status = self.get_api_limit_status()
                 return {
                     "total_trades": 0,
                     "win_rate": 0.0,
@@ -800,7 +901,8 @@ class ForexAITrader:
                     "worst_strategy": "None",
                     "daily_loss": round(self.current_daily_loss, 2),
                     "daily_limit": round(self.daily_loss_limit, 2),
-                    "open_trades": len(self.open_trades)
+                    "open_trades": len(self.open_trades),
+                    "api_status": api_status
                 }
             
             winning_trades = len([t for t in self.trade_history if t.profit_loss > 0])
@@ -829,6 +931,9 @@ class ForexAITrader:
                     worst_performance = avg_performance
                     worst_strategy = strategy
             
+            # Get API limit status
+            api_status = self.get_api_limit_status()
+            
             return {
                 "total_trades": total_trades,
                 "winning_trades": winning_trades,
@@ -841,7 +946,8 @@ class ForexAITrader:
                 "daily_loss": round(self.current_daily_loss, 2),
                 "daily_limit": round(self.daily_loss_limit, 2),
                 "open_trades": len(self.open_trades),
-                "account_balance": self.account_balance
+                "account_balance": self.account_balance,
+                "api_status": api_status
             }
             
         except Exception as e:
@@ -859,7 +965,14 @@ class ForexAITrader:
                 if self.daily_reset_time is None or current_date > self.daily_reset_time:
                     self.current_daily_loss = 0.0
                     self.daily_reset_time = current_date
-                    logger.info("Daily loss counter reset")
+                    # Also reset API limits
+                    if current_date > self.last_api_reset:
+                        self.gemini_requests_today = {}
+                        self.excluded_api_keys.clear()
+                        self.last_api_reset = current_date
+                        logger.info("Daily limits reset (loss counter and API keys)")
+                    else:
+                        logger.info("Daily loss counter reset")
                 
                 # Update open trades
                 self.update_open_trades()
@@ -887,10 +1000,10 @@ class ForexAITrader:
                         # AI analysis
                         analysis = await self.analyze_market_with_ai(pair, df)
                         
-                                        # Log current activity with API key info
-                current_price = df.iloc[-1]['close']
-                api_key_info = f"[API Key #{self.current_api_key_index + 1}]" if self.config.get('gemini_api_keys') else "[Mock AI]"
-                logger.info(f"{api_key_info} Analyzing {pair}: Price {current_price:.5f}, Action: {analysis.get('action', 'HOLD')}, Confidence: {analysis.get('confidence', 0):.2f}")
+                        # Log current activity with API key info
+                        current_price = df.iloc[-1]['close']
+                        api_key_info = f"[API Key #{self.current_api_key_index + 1}]" if self.config.get('gemini_api_keys') else "[Mock AI]"
+                        logger.info(f"{api_key_info} Analyzing {pair}: Price {current_price:.5f}, Action: {analysis.get('action', 'HOLD')}, Confidence: {analysis.get('confidence', 0):.2f}")
                         
                         # Execute paper trade if conditions are met
                         if analysis['action'] != 'HOLD':
@@ -1283,16 +1396,16 @@ class ForexAITrader:
             logger.info(f"Account Balance: ${self.account_balance:,.2f}")
             logger.info(f"Daily Loss Limit: ${self.daily_loss_limit:,.2f}")
             logger.info(f"Monitoring pairs: {', '.join(self.config['forex_pairs'])}")
-        
-        # Log API key status
-        api_keys = self.config.get('gemini_api_keys', [])
-        if api_keys and api_keys != ['your-gemini-api-key']:
-            logger.info(f"Gemini API Keys configured: {len(api_keys)} keys available")
-            for i, key in enumerate(api_keys):
-                logger.info(f"  API Key #{i+1}: ...{key[-4:]} (Limit: {self.gemini_daily_limit}/day)")
-        else:
-            logger.info("No Gemini API keys configured - using mock AI responses")
             
+            # Log API key status
+            api_keys = self.config.get('gemini_api_keys', [])
+            if api_keys and api_keys != ['your-gemini-api-key']:
+                logger.info(f"Gemini API Keys configured: {len(api_keys)} keys available")
+                for i, key in enumerate(api_keys):
+                    logger.info(f"  API Key #{i+1}: ...{key[-4:]} (Limit: {self.gemini_daily_limit}/day)")
+            else:
+                logger.info("No Gemini API keys configured - using mock AI responses")
+                
             # Create tasks for concurrent execution
             tasks = [
                 asyncio.create_task(self.continuous_learning_loop()),
