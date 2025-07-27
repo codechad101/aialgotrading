@@ -1028,7 +1028,7 @@ class ForexAITrader:
             print(f"Execute this trade? (y/n/auto): ", end="", flush=True)
             
             # Wait for user input with timeout
-            response = await self.wait_for_user_input(timeout=30)
+            response = await self.wait_for_user_input(timeout=5)
             
             if response.lower() in ['y', 'yes']:
                 return True
@@ -1043,7 +1043,7 @@ class ForexAITrader:
             logger.error(f"Error in trade confirmation: {e}")
             return False
 
-    async def wait_for_user_input(self, timeout: int = 30) -> str:
+    async def wait_for_user_input(self, timeout: int = 5) -> str:
         """Wait for user input with timeout"""
         try:
             # Use a simple approach for input with timeout
@@ -1053,7 +1053,7 @@ class ForexAITrader:
             if select.select([sys.stdin], [], [], timeout):
                 return input().strip()
             else:
-                print("⏰ Timeout - skipping trade")
+                print("⏰ 5-second timeout - skipping trade")
                 return "n"
         except:
             # Fallback for systems without select

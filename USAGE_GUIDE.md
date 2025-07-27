@@ -89,10 +89,11 @@ When a good trade opportunity is found, you'll see:
 Execute this trade? (y/n/auto):
 ```
 
-**Your Options:**
+**Your Options (5-second timeout):**
 - `y` or `yes` - Execute this trade
 - `n` or `no` - Skip this trade
 - `auto` - Execute and switch to automatic mode
+- ⏰ **No response in 5 seconds = Skip trade**
 
 ---
 
